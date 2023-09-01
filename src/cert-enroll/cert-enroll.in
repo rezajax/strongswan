@@ -1,0 +1,316 @@
+#!/bin/bash
+# Enroll or re-enroll X.509 certificates via EST or SCEP protocols using
+# the strongSwan pki tool
+#
+# Copyright (C) 2023 Andreas Steffen
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+
+##############################################################################
+# Set default configuration and installation scripts
+#
+CONFIG_DIR="@SYSCONFDIR@/cert-enroll.d"
+CONFIG_SCRIPT="$CONFIG_DIR/cert-enroll.conf"
+INSTALL_SCRIPT="$CONFIG_DIR/cert-install.conf"
+
+##############################################################################
+# Parse optional arguments
+#
+function help()
+{
+  echo "Usage:"
+  echo "cert-enroll [-c filename] [-i filename]"
+  echo "Options:"
+  echo "  -h   print usage information"
+  echo "  -c   configuration file, defaults to $CONFIG_SCRIPT"
+  echo "  -i   installation file,  defaults to $INSTALL_SCRIPT"
+ }
+
+while getopts "c:i:h" opt
+do
+  case "$opt" in
+  c)
+    CONFIG_SCRIPT=${OPTARG}
+    ;;
+  i)
+    INSTALL_SCRIPT=${OPTARG}
+    ;;
+  h)
+    help; exit 0
+    ;;
+  esac
+done
+
+##############################################################################
+# Set configuration parameters
+#
+. $CONFIG_SCRIPT
+
+# Path to the strongSwan pki command
+PKI="@BINDIR@/pki"
+
+##############################################################################
+# Define some local functions
+#
+function gen_private_key()
+{
+  $PKI --gen --type $type --size $size --outform pem > "$1"
+  if [ $? -ne 0 -o ! -s $1 ]
+  then
+    echo "Error: generation of $size bit $TYPE private key failed"
+    exit 1
+  fi
+  chmod 600 $1
+  echo "  generated $size bit $TYPE private key '$1'"
+}
+
+function gen_cert_request()
+{
+  $PKI --req --in "$1/$KEY" --type $type --dn "$DN" $SAN1 $SAN2 $SAN3 $SAN4 \
+             --profile $PROFILE --outform pem > "$1/$REQ"
+              
+  if [ $? -ne 0 -o ! -s $1 ]
+  then
+    echo "Error: generation of PKCS#10 certificate request failed"
+    exit 1
+  fi
+  chmod 600 $1
+  echo "  generated PKCS#10 certificate request"
+}
+
+function get_ca_certs()
+{
+  cd $1
+  if [ $CA_PROTOCOL == "EST" ]
+  then
+    $PKI --estca --url $EST_URL --cacert $TLSROOTCA --caout $CAOUT \
+                 --outform pem --force
+    if [ "$?" -ne 0 -o ! -s $ROOTCA -o ! -s $SUBCA ]
+    then
+      echo "Error: download of CA certificates via EST failed"
+      exit 1
+    fi
+    echo "  downloaded CA certificates via EST"
+  else
+    $PKI --scepca --url $SCEP_URL --caout $CAOUT --raout $RAOUT \
+                  --outform pem --force
+    if [ "$?" -ne 0 -o ! -s $ROOTCA -o ! -s $SUBCA -o ! -s $RACERT ]
+    then
+      echo "Error: download of CA or RA certificates via SCEP failed"
+      exit 1
+    fi
+    echo "  downloaded CA and RA certificates via SCEP"
+  fi
+  cd $DIR  
+}
+
+function check_ca_certs()
+{
+  get_ca_certs "$DIR/new"
+
+  if [ $(cmp -s $ROOTCA new/$ROOTCA) ]
+  then
+    ROOTCA_CHANGED="1"
+    echo "Warning: '$ROOTCA' has changed"
+  fi
+  if [ $(cmp -s $SUBCA new/$SUBCA) ]
+  then
+    SUBCA_CHANGED="1"
+    echo "Warning: '$SUBCA' has changed"
+  fi
+  if [ $ROOTCA_CHANGED -eq 0 -a $SUBCA_CHANGED -eq 0 ]
+  then
+    echo "Ok: '$ROOTCA' and '$SUBCA' are unchanged"
+ fi
+}
+
+##############################################################################
+# SCEP certificate enrollment protocol requires RSA
+#
+if [ $PROTOCOL == "SCEP" -a $TYPE == "ECDSA" ]
+then
+  echo "  the SCEP protocol does not support ECDSA keys, switched to RSA key"
+  TYPE="RSA"
+fi
+
+##############################################################################
+# Select key size
+#
+if [ $TYPE == "RSA" ]
+then
+  type="rsa"
+  size=$RSA_SIZE
+else
+  type="ecdsa"
+  size=$ECDSA_SIZE 
+fi 
+
+##############################################################################
+# Create and change into certificates directory
+#
+mkdir -p $DIR/new $DIR/old
+cd $DIR
+echo "  changed into the '$DIR' directory"
+
+#############################################################################
+# Fetch the CA certificates with the selected enrollment protocol if possible
+#
+if [ $CA_PROTOCOL == "EST" -a ! -s $TLSROOTCA ]
+then
+  echo "  no TLS root CA certificate for EST available," \
+       "revert to SCEP CA protocol"
+  CA_PROTOCOL="SCEP"
+fi
+
+##############################################################################
+# Check if non-empty certficate already exists
+#
+if [ -s $CERT ]
+then
+##############################################################################
+# Determine the remaining validity of the certificate in days
+#
+  DAYS=$($PKI --print --in $CERT | awk '/not after/ {
+    if (($7 == "ok") && ($11 == "days)")) {
+      print $10
+    } else {
+      printf("0")
+    }
+  }' -)
+
+  if [ $DAYS -ge $MIN_DAYS ]
+  then
+    echo "Ok: validity of '$CERT' is $DAYS days," \
+         "more than the minimum of $MIN_DAYS days"
+
+    if [ $(expr $DAYS % $CA_CHECK_INTERVAL) -eq 0 ]
+    then
+      check_ca_certs
+    fi
+    exit 0
+  fi
+  echo "Warning: validity of '$CERT' is only $DAYS days," \
+       "less than the minimum of $MIN_DAYS days"
+
+##############################################################################
+# Generate new private key
+#   
+  gen_private_key "new/$KEY"
+  
+##############################################################################
+# Get and check CA and RA certificates via SCEP or EST
+#
+  check_ca_certs
+
+  if [ $CA_PROTOCOL == "SCEP" ]
+  then
+    mv $ROOTCA $SUBCA $RACERT old
+    mv new/$ROOTCA new/$SUBCA new/$RACERT .
+  else
+    mv $ROOTCA $SUBCA $old
+    mv new/$ROOTCA new/$SUBCA .
+  fi
+
+##############################################################################
+# Re-enroll certificate via SCEP or EST
+#
+  if [ $PROTOCOL == "SCEP" ]
+  then
+    $PKI --scep --url $SCEP_URL --in new/$KEY --key $KEY --cert $CERT \
+                --dn "$DN" $SAN1 $SAN2 $SAN3 $SAN4 \
+                --cacert-sig $SUBCA --cacert-enc $RACERT --cacert $ROOTCA \
+                --maxpolltime $SCEP_MAX_POLL_TIME --profile $PROFILE \
+                --outform pem > new/$CERT
+  else
+    gen_cert_request "$DIR/new"
+    $PKI --est --url $EST_URL --in new/$REQ --cacert $ROOTCA --cacert $SUBCA \
+               --cacert $TLSROOTCA --key $KEY --cert $CERT \
+               --maxpolltime $EST_MAX_POLL_TIME --outform pem > new/$CERT
+  fi
+
+  if [ "$?" -ne 0 -o ! -s $CERT ]
+  then
+    echo "Error: re-enrollment via $PROTOCOL failed"
+    exit 1
+  fi
+  echo "  re-enrolled '$CERT' via $PROTOCOL"
+
+##############################################################################
+# Replace old key and certificate
+#
+  mv $KEY $CERT old
+  mv new/$KEY new/$CERT .
+  if [ $PROTOCOL == "EST" ]
+  then
+    mv $REQ old
+    mv new/$REQ .
+  fi
+  echo "  replaced old '$KEY' and '$CERT'"
+
+  
+##############################################################################
+# Install keys and certificates
+#
+  . $INSTALL_SCRIPT "$CONFIG_SCRIPT"
+  exit 0
+else
+##############################################################################
+# No certificate exists yet
+#
+  echo "  '$CERT' doesn't exist yet"
+
+##############################################################################
+# Generate private key
+#
+  gen_private_key "$KEY"
+
+##############################################################################
+# Get CA and RA certificates via SCEP
+#
+  get_ca_certs "$DIR"
+
+##############################################################################
+# Enroll certificate via SCEP or EST
+#
+  if [ $PROTOCOL == "SCEP" ]
+  then
+    $PKI --scep --url $SCEP_URL --in $KEY --dn "$DN" $SAN1 $SAN2 $SAN3 $SAN4 \
+                --cacert-sig $SUBCA --cacert-enc $RACERT --cacert $ROOTCA \
+                --profile $PROFILE --maxpolltime $SCEP_MAX_POLL_TIME \
+                --outform pem > $CERT
+  else
+    gen_cert_request "$DIR"
+    $PKI --est --url $EST_URL --in $REQ --cacert $ROOTCA --cacert $SUBCA \
+               --cacert $TLSROOTCA --maxpolltime $EST_MAX_POLL_TIME \
+               --outform pem > $CERT
+  fi
+
+  if [ "$?" -ne 0 -o ! -s $CERT ]
+  then
+    echo "Error: enrollment via $PROTOCOL failed"
+    exit 1
+  fi
+  echo "  enrolled '$CERT' via $PROTOCOL"
+  
+##############################################################################
+# Install keys and certificates
+#
+  . $INSTALL_SCRIPT "$CONFIG_SCRIPT"
+  exit 0
+fi

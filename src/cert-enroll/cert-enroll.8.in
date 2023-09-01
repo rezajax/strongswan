@@ -1,0 +1,71 @@
+.TH CERT-ENROLL 8 "2023-09-01" "@PACKAGE_VERSION@" "strongSwan"
+.
+.SH "NAME"
+.
+cert-enroll \- Requests X.509 certificates from a PKI via EST or SCEP protocols
+.
+.SH "SYNOPSIS"
+.
+.SY "cert-enroll"
+.OP \-c "filename"
+.OP \-i "filename"
+.YS
+.
+.SY "cert-enroll"
+.B \-h
+.YS
+.
+.SH "DESCRIPTION"
+.
+.B cert-enroll
+uses the strongSwan
+.BR pki
+command to request an initial X.509 certificate from a PKI server using either
+the EST (Enrollment over Secure Transport) or the SCEP (Simple Certificate
+Enrollment Protocol) certificate enrollment protocol. After having received the
+host certificate, its expiration date can be monitored periodically and a new
+certificate will be automatically requested when a predefined deadline of
+remaining validity days is reached. The generated RSA or EDCSA private key and
+the downloaded X.509 certificate can then be installed in specific places on the
+host via the
+.BR cert-install.conf
+installation script that can be customized to fit any application. The default
+installation script copies the host key, the host certificate and the CA
+certificates into the corresponding @sysconfdir@/swanctl/ subdirectories.
+.
+.SH "OPTIONS"
+.
+.TP
+.B "\-h"
+Prints usage information and a short summary of the available commands.
+.TP
+.BI "\-c " filename
+Path to configuration file, defaults to @sysconfdir@/cert-enroll.d/cert-enroll.conf.
+.TP
+.BI "\-i " filename
+Path to installation file, defaults to @sysconfdir@/cert-enroll.d/cert-install.conf.
+.
+.SH "CONFIGURATION"
+.
+The configuration parameters for the
+.BR cert-enroll
+script are defined in
+.BR cert-enroll.conf.
+.
+.SH FILES
+.
+.nf
+.na
+@sysconfdir@/cert-enroll/cert-enroll.conf     default configuration file
+.ad
+.fi
+.nf
+.na
+@sysconfdir@/cert-enroll/cert-install.conf    default installation file
+.ad
+.fi
+.nf
+.na
+/root/certificates/                   default certificate directory
+.ad
+.fi
