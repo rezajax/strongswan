@@ -1,7 +1,7 @@
 # strongSwan Configuration #
 
 ## Overview ##
-
+  
 strongSwan is an OpenSource IPsec-based VPN solution.
 
 This document is just a short introduction of the strongSwan **swanctl** command
